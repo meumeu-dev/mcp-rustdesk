@@ -1,0 +1,29 @@
+# Build artifacts
+rustdesk/
+vcpkg/
+vcpkg-cache/
+target/
+*.png
+*.jpg
+*.jpeg
+*.log
+*.sock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local config / secrets
+*.local.json
+.env.local
+secrets/

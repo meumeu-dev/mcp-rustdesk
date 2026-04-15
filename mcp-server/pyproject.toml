@@ -1,0 +1,19 @@
+[project]
+name = "mcp-rustdesk-server"
+version = "0.1.0"
+description = "MCP server that lets an LLM see and control a remote machine via RustDesk."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0",
+    "pillow>=10.0",
+    "google-genai>=1.0",
+]
+
+[project.scripts]
+mcp-rustdesk-server = "server:mcp.run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
