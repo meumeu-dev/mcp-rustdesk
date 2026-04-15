@@ -118,6 +118,13 @@ Environment variables consumed by the server:
 | `RUSTDESK_VIEWER_PORT` | (unset) | auto-start the local HTTP viewer on that port |
 | `RUSTDESK_VIEWER_FPS` | 5 | refresh rate of the HTTP viewer |
 
+Environment variables consumed by the daemon:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `RUSTDESK_APPNAME` | `RustDesk-headless` | isolates config / IPC from a classic RustDesk install (`~/.config/RustDesk-headless/`, `/tmp/RustDesk-headless/`). Set to `RustDesk` to share identity with the classic client. |
+| `RUSTDESK_SOCKET` | `$XDG_RUNTIME_DIR/rustdesk-headless.sock` | path to the daemon's JSON-RPC socket |
+
 ### 4. Start the daemon
 
 ```sh

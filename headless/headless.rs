@@ -505,6 +505,16 @@ fn default_socket_path() -> String {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ResultType<()> {
     env_logger::init();
+
+    // Isolate our state from the classic RustDesk client: different
+    // config dir (~/.config/RustDesk-headless/), different IPC sockets
+    // (/tmp/RustDesk-headless/), different logs. Users who *want* to
+    // share identity with the classic client can set
+    // RUSTDESK_APPNAME=RustDesk to opt out.
+    let app_name = std::env::var("RUSTDESK_APPNAME")
+        .unwrap_or_else(|_| "RustDesk-headless".to_string());
+    *hbb_common::config::APP_NAME.write().unwrap() = app_name;
+
     let socket_path = default_socket_path();
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)?;
