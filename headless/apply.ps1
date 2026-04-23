@@ -44,8 +44,24 @@ if ($missing.Count -gt 0) {
 }
 
 Write-Step "Cloning RustDesk into $Target"
+# A CI cache may have restored rustdesk\target\ (creating rustdesk\ as a
+# side effect) before this step runs; in that case `git clone` aborts on
+# a non-empty destination. Move target\ aside, wipe, clone, restore.
+$SavedTarget = $null
+if ((Test-Path $Target) -and -not (Test-Path (Join-Path $Target ".git"))) {
+    $targetDir = Join-Path $Target "target"
+    if (Test-Path $targetDir) {
+        $SavedTarget = "$Target.target.saved"
+        if (Test-Path $SavedTarget) { Remove-Item -Recurse -Force $SavedTarget }
+        Move-Item -Path $targetDir -Destination $SavedTarget -Force
+    }
+    Remove-Item -Recurse -Force $Target
+}
 if (-not (Test-Path (Join-Path $Target ".git"))) {
     git clone --depth 1 --branch $Ref $Repo $Target
+}
+if ($SavedTarget -and (Test-Path $SavedTarget)) {
+    Move-Item -Path $SavedTarget -Destination (Join-Path $Target "target") -Force
 }
 git -C $Target submodule update --init --recursive
 

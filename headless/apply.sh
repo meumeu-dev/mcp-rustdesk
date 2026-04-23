@@ -63,8 +63,23 @@ EOF
 fi
 
 bold "==> Cloning RustDesk into $TARGET"
+# A CI cache may have restored rustdesk/target/ (creating rustdesk/ as a
+# side effect) before we get here; in that case `git clone` aborts on a
+# non-empty destination. Move target/ aside, wipe, clone, then restore.
+saved_target=""
+if [[ -d "$TARGET" && ! -d "$TARGET/.git" ]]; then
+  if [[ -d "$TARGET/target" ]]; then
+    saved_target="${TARGET%/}.target.saved"
+    rm -rf "$saved_target"
+    mv "$TARGET/target" "$saved_target"
+  fi
+  rm -rf "$TARGET"
+fi
 if [[ ! -d "$TARGET/.git" ]]; then
   git clone --depth 1 --branch "$RUSTDESK_REF" "$RUSTDESK_REPO" "$TARGET"
+fi
+if [[ -n "$saved_target" && -d "$saved_target" ]]; then
+  mv "$saved_target" "$TARGET/target"
 fi
 git -C "$TARGET" submodule update --init --recursive
 
