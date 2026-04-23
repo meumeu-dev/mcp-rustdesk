@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """MCP server for RustDesk headless client.
 
-Talks to the rustdesk-headless binary via a Unix socket (line-delimited JSON-RPC).
-Exposes tools that let Claude see and control a remote machine over the RustDesk
-protocol (E2EE, NAT traversal, codecs).
+Talks to the rustdesk-headless binary via a TCP loopback socket
+(line-delimited JSON-RPC, shared-token auth). Works on Linux, macOS
+and Windows. Exposes tools that let Claude see and control a remote
+machine over the RustDesk protocol (E2EE, NAT traversal, codecs).
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ import base64
 import io
 import json
 import os
+import sys
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -20,22 +23,42 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
-def _default_socket_path() -> str:
-    """Mirror the daemon's `default_socket_path()` (see headless.rs)."""
-    if env := os.environ.get("RUSTDESK_SOCKET"):
+
+def _rendezvous_path() -> str:
+    """Mirror the daemon's `rendezvous_file_path()` (see headless.rs).
+
+    The daemon writes {version, host, port, token, pid} to this JSON file
+    (owner-only on Unix) so the client can locate it and authenticate.
+    """
+    if env := os.environ.get("RUSTDESK_HEADLESS_RENDEZVOUS"):
         return env
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        return os.path.join(base, "RustDesk-headless", "daemon.json")
+    # Linux prefers XDG_RUNTIME_DIR when set; macOS never sets it.
+    if sys.platform.startswith("linux") and (rt := os.environ.get("XDG_RUNTIME_DIR")):
+        return os.path.join(rt, "rustdesk-headless", "daemon.json")
     uid = os.geteuid()
-    if rt := os.environ.get("XDG_RUNTIME_DIR"):
-        return os.path.join(rt, "rustdesk-headless.sock")
-    # Subprocess clients (e.g. an MCP server launched by an editor) often
-    # don't inherit XDG_RUNTIME_DIR; fall back to the canonical path.
-    canonical = f"/run/user/{uid}/rustdesk-headless.sock"
-    if os.path.exists(canonical):
-        return canonical
-    return f"/tmp/rustdesk-headless-{uid}.sock"
+    return os.path.join(tempfile.gettempdir(), f"rustdesk-headless-{uid}", "daemon.json")
 
 
-SOCKET_PATH = _default_socket_path()
+def _read_rendezvous() -> dict[str, Any]:
+    path = _rendezvous_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"rustdesk-headless rendezvous file not found: {path}. "
+            f"Is the daemon running?"
+        )
+    except OSError as e:
+        raise RuntimeError(f"cannot read rendezvous file {path}: {e}")
+    for field_name in ("port", "token"):
+        if field_name not in data:
+            raise RuntimeError(f"rendezvous file missing '{field_name}'")
+    return data
+
 
 mcp = FastMCP("rustdesk")
 
@@ -65,15 +88,33 @@ _rpc: Rpc | None = None
 _rpc_lock = asyncio.Lock()
 
 
+async def _authenticate(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, token: str) -> None:
+    """Send the mandatory auth handshake as the very first line."""
+    req = {"id": "auth", "method": "auth", "params": {"token": token}}
+    writer.write((json.dumps(req) + "\n").encode())
+    await writer.drain()
+    line = await reader.readline()
+    if not line:
+        raise RuntimeError("daemon closed during auth handshake")
+    resp = json.loads(line.decode())
+    if resp.get("error"):
+        raise RuntimeError(f"daemon auth rejected: {resp['error']}")
+
+
 async def rpc() -> Rpc:
     global _rpc
     async with _rpc_lock:
         if _rpc is None or _rpc.writer.is_closing():
+            rdv = _read_rendezvous()
+            host = rdv.get("host", "127.0.0.1")
+            port = int(rdv["port"])
+            token = rdv["token"]
             # asyncio default StreamReader buffer is 64 KiB; PNG screenshots
             # can be > 1 MiB after base64 → bump it.
-            reader, writer = await asyncio.open_unix_connection(
-                SOCKET_PATH, limit=64 * 1024 * 1024
+            reader, writer = await asyncio.open_connection(
+                host, port, limit=64 * 1024 * 1024
             )
+            await _authenticate(reader, writer, token)
             _rpc = Rpc(reader, writer, asyncio.Lock())
         return _rpc
 

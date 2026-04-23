@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Clone RustDesk, apply our patches, and build the `rustdesk-headless` binary.
 #
+# Works on Linux and macOS. For Windows, see `headless/apply.ps1`.
+#
 # Usage:
 #   ./headless/apply.sh [target-dir]
 #
@@ -17,7 +19,11 @@ RUSTDESK_REPO="${RUSTDESK_REPO:-https://github.com/rustdesk/rustdesk.git}"
 RUSTDESK_REF="${RUSTDESK_REF:-master}"
 VCPKG_DIR="${VCPKG_DIR:-$REPO_ROOT/vcpkg}"
 
+OS="$(uname -s)"
+
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+
+bold "==> Host OS: $OS"
 
 bold "==> Checking host build prerequisites"
 need=()
@@ -25,7 +31,9 @@ for cmd in git cargo cmake nasm yasm clang pkg-config; do
   command -v "$cmd" >/dev/null 2>&1 || need+=("$cmd")
 done
 if (( ${#need[@]} > 0 )); then
-  cat <<EOF
+  case "$OS" in
+    Linux)
+      cat <<EOF
 Missing build tools: ${need[*]}
 Install on Debian/Ubuntu:
   sudo apt-get install -y nasm yasm clang cmake pkg-config \\
@@ -36,6 +44,21 @@ Install on Debian/Ubuntu:
 
 Install Rust via https://rustup.rs/ if missing.
 EOF
+      ;;
+    Darwin)
+      cat <<EOF
+Missing build tools: ${need[*]}
+Install on macOS (Homebrew):
+  xcode-select --install                  # if not already installed
+  brew install nasm yasm cmake pkg-config llvm
+
+Install Rust via https://rustup.rs/ if missing.
+EOF
+      ;;
+    *)
+      echo "Unsupported OS: $OS. Missing: ${need[*]}"
+      ;;
+  esac
   exit 1
 fi
 

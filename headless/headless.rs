@@ -1,30 +1,46 @@
-//! RustDesk headless client — exposes a local Unix socket (line-delimited
-//! JSON-RPC) so an external tool (the MCP server) can: connect to a peer,
-//! grab the latest decoded frame as PNG, and inject mouse/keyboard events.
+//! RustDesk headless client — exposes a local TCP loopback socket
+//! (line-delimited JSON-RPC, auth by shared token) so an external tool
+//! (the MCP server) can: connect to a peer, grab the latest decoded
+//! frame as PNG, and inject mouse/keyboard events.
+//!
+//! Cross-platform (Linux / macOS / Windows). At startup the daemon:
+//!   1. generates a random 32-byte auth token,
+//!   2. binds 127.0.0.1:0 (OS picks a free port),
+//!   3. writes {version, port, token, pid} to a user-only "rendezvous"
+//!      file the client reads to locate + authenticate the daemon.
 //!
 //! Runs inside the rustdesk crate, so it can call internal `pub` APIs
 //! (`Session`, `send_mouse`, `send_key_event`, `io_loop`, …) directly.
 
 use std::io::Cursor;
-use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use hbb_common::{
     anyhow::anyhow,
     base64::{engine::general_purpose::STANDARD as B64, Engine as _},
-    env_logger, libc, log,
+    env_logger, log,
     message_proto::*,
+    rand::{rngs::OsRng, RngCore},
     rendezvous_proto::ConnType,
     serde_json::{self, json, Value},
     tokio::{
         self,
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-        net::{UnixListener, UnixStream},
+        net::{
+            tcp::{OwnedReadHalf, OwnedWriteHalf},
+            TcpListener, TcpStream,
+        },
         sync::oneshot,
     },
     ResultType,
 };
 use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+use hbb_common::libc;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use librustdesk::client::{send_mouse, QualityStatus};
 use librustdesk::ui_session_interface::{io_loop, InvokeUiSession, Session};
@@ -168,10 +184,8 @@ struct Active {
 
 fn encode_png(frame: &RgbaFrame) -> ResultType<Vec<u8>> {
     use image::{ImageBuffer, Rgba};
-    // RustDesk's ImageRgb is BGRA on most platforms; convert to RGBA.
     let mut rgba = frame.data.clone();
     if matches!(frame.fmt, scrap::ImageFormat::ABGR) {
-        // ABGR → RGBA: swap B and R (i.e. indices 0 and 2)
         for px in rgba.chunks_exact_mut(4) {
             px.swap(0, 2);
         }
@@ -218,10 +232,8 @@ async fn handle_request(
         "screenshot" => {
             let guard = active.read().unwrap();
             let Some(a) = guard.as_ref() else {
-                return err(rid, "not connected".into());
+                return err_resp(rid, "not connected".into());
             };
-            // Clone the latest frame instead of taking it, so successive
-            // screenshot calls between two on_rgba pushes still work.
             let frame_opt: Option<RgbaFrame> = a.state.rgba.lock().unwrap().as_ref().map(|f| RgbaFrame {
                 data: f.data.clone(),
                 w: f.w,
@@ -233,7 +245,7 @@ async fn handle_request(
                 None => Err("no frame yet".to_string()),
                 Some(f) => match encode_png(&f) {
                     Ok(png) => Ok(json!({
-                        "png_b64": base64_encode(&png),
+                        "png_b64": B64.encode(&png),
                         "width": f.w,
                         "height": f.h,
                     })),
@@ -244,7 +256,7 @@ async fn handle_request(
         "mouse" => {
             let guard = active.read().unwrap();
             let Some(a) = guard.as_ref() else {
-                return err(rid, "not connected".into());
+                return err_resp(rid, "not connected".into());
             };
             let mask = req.params["mask"].as_i64().unwrap_or(0) as i32;
             let x = req.params["x"].as_i64().unwrap_or(0) as i32;
@@ -259,7 +271,7 @@ async fn handle_request(
         "key" => {
             let guard = active.read().unwrap();
             let Some(a) = guard.as_ref() else {
-                return err(rid, "not connected".into());
+                return err_resp(rid, "not connected".into());
             };
             let key = req.params["key"].as_str().unwrap_or("").to_string();
             let modifiers: Vec<String> = req.params["modifiers"]
@@ -281,7 +293,7 @@ async fn handle_request(
         "type" => {
             let guard = active.read().unwrap();
             let Some(a) = guard.as_ref() else {
-                return err(rid, "not connected".into());
+                return err_resp(rid, "not connected".into());
             };
             let text = req.params["text"].as_str().unwrap_or("").to_string();
             for ch in text.chars() {
@@ -301,10 +313,6 @@ async fn handle_request(
         Ok(v) => Response { id: rid, result: Some(v), error: None },
         Err(e) => err_resp(rid, e),
     }
-}
-
-fn err(rid: Value, msg: String) -> Response {
-    err_resp(rid, msg)
 }
 
 fn err_resp(rid: Value, msg: String) -> Response {
@@ -374,10 +382,6 @@ fn build_key_event(name: &str, modifiers: &[String]) -> Option<KeyEvent> {
     Some(evt)
 }
 
-fn base64_encode(data: &[u8]) -> String {
-    B64.encode(data)
-}
-
 async fn connect_rpc(
     params: Value,
     active: &Arc<RwLock<Option<Active>>>,
@@ -390,10 +394,6 @@ async fn connect_rpc(
         .or_else(|| params["relay_server"].as_str())
         .unwrap_or("");
 
-    // RustDesk encodes a per-connection rendezvous override in the peer_id
-    // itself: `<id>@<server>?key=<base64>`. Build it if the caller supplied
-    // overrides; otherwise the daemon falls back to its standard RustDesk
-    // config (~/.config/rustdesk/RustDesk2.toml) or the public servers.
     let composite_id = if !rendezvous.is_empty() {
         let key_suffix = if key.is_empty() { String::new() } else { format!("?key={key}") };
         format!("{peer_id}@{rendezvous}{key_suffix}")
@@ -423,11 +423,6 @@ async fn connect_rpc(
         io_loop(session_clone, 1);
     });
 
-    // Wait up to 60s for a frame to arrive (true signal of a working session).
-    // RustDesk does its own retry dance (direct → rendezvous → relay); transient
-    // msgbox "error:" entries happen mid-flow and are NOT terminal, so we only
-    // watch for either (a) the first rgba frame, or (b) an auth/credentials
-    // failure that won't be retried.
     let (tx, rx) = oneshot::channel::<Result<(), String>>();
     let state_check = state.clone();
     tokio::spawn(async move {
@@ -464,70 +459,202 @@ async fn connect_rpc(
     }
 }
 
-// ----- socket server -----
+// ----- IPC server (TCP loopback + shared-token auth) -----
+
+async fn write_resp(wr: &mut OwnedWriteHalf, resp: &Response) -> ResultType<()> {
+    let mut s = serde_json::to_string(resp)?;
+    s.push('\n');
+    wr.write_all(s.as_bytes()).await?;
+    Ok(())
+}
+
+async fn read_line(rd: &mut BufReader<OwnedReadHalf>) -> ResultType<Option<String>> {
+    let mut buf = String::new();
+    match rd.read_line(&mut buf).await? {
+        0 => Ok(None),
+        _ => {
+            if buf.ends_with('\n') {
+                buf.pop();
+                if buf.ends_with('\r') {
+                    buf.pop();
+                }
+            }
+            Ok(Some(buf))
+        }
+    }
+}
 
 async fn handle_client(
-    stream: UnixStream,
+    stream: TcpStream,
     active: Arc<RwLock<Option<Active>>>,
+    token: Arc<String>,
 ) -> ResultType<()> {
     let (rd, mut wr) = stream.into_split();
-    let mut lines = BufReader::new(rd).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut rd = BufReader::new(rd);
+
+    // First frame MUST be {"method":"auth","params":{"token":"..."}}.
+    // Anything else → drop after a single error response.
+    let first = match read_line(&mut rd).await? {
+        Some(l) => l,
+        None => return Ok(()),
+    };
+    let auth_req: Request = match serde_json::from_str(&first) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = err_resp(Value::Null, format!("bad auth json: {e}"));
+            write_resp(&mut wr, &resp).await?;
+            return Ok(());
+        }
+    };
+    if auth_req.method != "auth" {
+        let resp = err_resp(auth_req.id, "auth required as first message".into());
+        write_resp(&mut wr, &resp).await?;
+        return Ok(());
+    }
+    let supplied = auth_req.params["token"].as_str().unwrap_or("");
+    if !constant_time_eq(supplied.as_bytes(), token.as_bytes()) {
+        let resp = err_resp(auth_req.id, "auth failed".into());
+        write_resp(&mut wr, &resp).await?;
+        return Ok(());
+    }
+    let ok = Response {
+        id: auth_req.id,
+        result: Some(json!({"ok": true})),
+        error: None,
+    };
+    write_resp(&mut wr, &ok).await?;
+
+    while let Some(line) = read_line(&mut rd).await? {
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
                 let resp = err_resp(Value::Null, format!("bad json: {e}"));
-                let mut s = serde_json::to_string(&resp)?;
-                s.push('\n');
-                wr.write_all(s.as_bytes()).await?;
+                write_resp(&mut wr, &resp).await?;
                 continue;
             }
         };
         let resp = handle_request(req, &active).await;
-        let mut s = serde_json::to_string(&resp)?;
-        s.push('\n');
-        wr.write_all(s.as_bytes()).await?;
+        write_resp(&mut wr, &resp).await?;
     }
     Ok(())
 }
 
-fn default_socket_path() -> String {
-    if let Ok(p) = std::env::var("RUSTDESK_SOCKET") {
-        return p;
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
-        let p = std::path::Path::new(&rt).join("rustdesk-headless.sock");
-        return p.to_string_lossy().into_owned();
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
     }
-    format!("/tmp/rustdesk-headless-{}.sock", unsafe { libc::geteuid() })
+    diff == 0
 }
+
+// ----- Rendezvous file (port + token) -----
+
+fn rendezvous_file_path() -> PathBuf {
+    if let Ok(p) = std::env::var("RUSTDESK_HEADLESS_RENDEZVOUS") {
+        return PathBuf::from(p);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        return base.join("RustDesk-headless").join("daemon.json");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR") {
+            return PathBuf::from(rt)
+                .join("rustdesk-headless")
+                .join("daemon.json");
+        }
+    }
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::geteuid() };
+        return std::env::temp_dir()
+            .join(format!("rustdesk-headless-{}", uid))
+            .join("daemon.json");
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        std::env::temp_dir().join("rustdesk-headless").join("daemon.json")
+    }
+}
+
+fn write_rendezvous_file(path: &PathBuf, port: u16, token: &str) -> ResultType<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let content = json!({
+        "version": 1,
+        "host": "127.0.0.1",
+        "port": port,
+        "token": token,
+        "pid": std::process::id(),
+    });
+    let body = serde_json::to_string(&content)?;
+    // Atomic write: temp + rename so a racing client never sees a truncated file.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+// ----- main -----
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ResultType<()> {
     env_logger::init();
 
-    // Isolate our state from the classic RustDesk client: different
-    // config dir (~/.config/RustDesk-headless/), different IPC sockets
-    // (/tmp/RustDesk-headless/), different logs. Users who *want* to
-    // share identity with the classic client can set
-    // RUSTDESK_APPNAME=RustDesk to opt out.
+    // Isolate our state from the classic RustDesk client: different config
+    // dir, different IPC, different logs. Users may pick another suffix
+    // (e.g. RUSTDESK_APPNAME=RustDesk-mcp) but sharing identity with the
+    // classic client is refused — would collide on the internal IPC
+    // pipe/socket and config lock and break any running RustDesk.app.
     let app_name = std::env::var("RUSTDESK_APPNAME")
         .unwrap_or_else(|_| "RustDesk-headless".to_string());
+    if app_name == "RustDesk" {
+        return Err(anyhow!(
+            "RUSTDESK_APPNAME=RustDesk is refused: the headless daemon must \
+             stay isolated from the classic RustDesk client. Pick another \
+             suffix (default: RustDesk-headless) or unset the variable."
+        ));
+    }
     *hbb_common::config::APP_NAME.write().unwrap() = app_name;
 
-    let socket_path = default_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
-    let listener = UnixListener::bind(&socket_path)?;
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-    log::info!("rustdesk-headless listening on {}", socket_path);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+
+    let mut token_bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut token_bytes);
+    let token = B64.encode(token_bytes);
+
+    let rdv_path = rendezvous_file_path();
+    write_rendezvous_file(&rdv_path, port, &token)?;
+
+    log::info!("rustdesk-headless listening on 127.0.0.1:{}", port);
+    log::info!("rendezvous file: {}", rdv_path.display());
 
     let active: Arc<RwLock<Option<Active>>> = Arc::new(RwLock::new(None));
+    let token = Arc::new(token);
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer_addr) = listener.accept().await?;
+        if !peer_addr.ip().is_loopback() {
+            log::warn!("rejecting non-loopback peer {}", peer_addr);
+            continue;
+        }
         let active = active.clone();
+        let token = token.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, active).await {
+            if let Err(e) = handle_client(stream, active, token).await {
                 log::error!("client error: {e}");
             }
         });

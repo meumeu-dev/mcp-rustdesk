@@ -13,6 +13,10 @@ parallel for continuous narration.
 > [VNC](https://github.com/hrrrsn/mcp-vnc) and computer-use MCPs, but
 > with the security and codec advantages of RustDesk's protocol.
 
+Runs on **Linux, macOS and Windows** (daemon + MCP server). The
+daemon ships a cross-platform loopback IPC (TCP 127.0.0.1 + token
+auth) so the same code path works on every host.
+
 ## Why RustDesk and not VNC?
 
 | | VNC MCPs | mcp-rustdesk | Anthropic Computer Use |
@@ -36,13 +40,19 @@ LLM client (Claude Code, etc.)
     │ stdio MCP
     ▼
 mcp-server/server.py            ← Python, FastMCP
-    │ Unix socket JSON-RPC
+    │ TCP 127.0.0.1 + token JSON-RPC
     ▼
 rustdesk-headless               ← Rust, built from RustDesk + our patch
     │ RustDesk protocol (E2EE)
     ▼
 remote peer (any RustDesk client, any OS)
 ```
+
+At startup the daemon binds `127.0.0.1:0` (OS picks a free port),
+generates a 32-byte random auth token, and writes a user-only
+rendezvous file (`{host, port, token, pid}`) the Python server reads
+to locate and authenticate to it. No Unix sockets, no named pipes —
+one code path on every OS.
 
 A local HTTP viewer (`rustdesk_viewer_start`) lets a human watch the
 exact frames the LLM sees, in real time.
@@ -54,7 +64,8 @@ exact frames the LLM sees, in real time.
 ├── headless/                    Rust source for the headless RustDesk binary
 │   ├── headless.rs              gets copied into rustdesk/src/bin/
 │   ├── lib.rs.patch             visibility patch on the rustdesk crate
-│   └── apply.sh                 clone, patch, build everything
+│   ├── apply.sh                 Linux / macOS: clone, patch, build
+│   └── apply.ps1                Windows:       clone, patch, build
 └── mcp-server/                  Python MCP server
     ├── server.py
     ├── requirements.txt
@@ -63,7 +74,23 @@ exact frames the LLM sees, in real time.
 
 ## Install
 
-### 1. Build the headless RustDesk binary
+### Option A — pre-built release (quickest)
+
+Download the archive for your OS from the
+[latest release](https://github.com/meumeu-dev/mcp-rustdesk/releases):
+
+- `rustdesk-headless-linux-x64.tar.gz`
+- `rustdesk-headless-macos-arm64.tar.gz` / `-macos-x64.tar.gz`
+- `rustdesk-headless-windows-x64.zip`
+
+Extract the binary anywhere on your `$PATH` (or note its absolute path).
+
+### Option B — build from source
+
+First build pulls ~700 crates plus libvpx/libyuv/opus/aom via vcpkg —
+count 30–60 min.
+
+**Linux / macOS:**
 
 ```sh
 git clone https://github.com/meumeu-dev/mcp-rustdesk.git
@@ -71,19 +98,37 @@ cd mcp-rustdesk
 ./headless/apply.sh                    # clones rustdesk + patches + cargo build
 ```
 
-Outputs `rustdesk/target/release/rustdesk-headless`. First build pulls
-~700 crates plus libvpx/libyuv/opus/aom via vcpkg — count 30–60 min.
+Outputs `rustdesk/target/release/rustdesk-headless`.
 
-### 2. Set up the Python MCP server
+**Windows (PowerShell):**
+
+```powershell
+git clone https://github.com/meumeu-dev/mcp-rustdesk.git
+cd mcp-rustdesk
+.\headless\apply.ps1
+```
+
+Outputs `rustdesk\target\release\rustdesk-headless.exe`. Requires Visual
+Studio 2022 Build Tools, Rust (`rustup default stable-msvc`), and
+`choco install cmake nasm yasm`.
+
+### Set up the Python MCP server
 
 ```sh
 python3 -m venv mcp-server/.venv
 mcp-server/.venv/bin/pip install -r mcp-server/requirements.txt
 ```
 
-### 3. Register the MCP with your client
+On Windows:
 
-Claude Code:
+```powershell
+python -m venv mcp-server\.venv
+mcp-server\.venv\Scripts\pip install -r mcp-server\requirements.txt
+```
+
+### Register the MCP with your client
+
+Claude Code (Linux / macOS):
 
 ```sh
 claude mcp add rustdesk -s user \
@@ -109,36 +154,56 @@ Or as plain JSON in your client's MCP config:
 }
 ```
 
-Environment variables consumed by the server:
-
-| Var | Default | Purpose |
-|---|---|---|
-| `RUSTDESK_SOCKET` | `$XDG_RUNTIME_DIR/rustdesk-headless.sock` | path to the daemon socket |
-| `GEMINI_API_KEY` | (unset) | required only if you call `rustdesk_watch_start` |
-| `RUSTDESK_VIEWER_PORT` | (unset) | auto-start the local HTTP viewer on that port |
-| `RUSTDESK_VIEWER_FPS` | 5 | refresh rate of the HTTP viewer |
-
-Environment variables consumed by the daemon:
-
-| Var | Default | Purpose |
-|---|---|---|
-| `RUSTDESK_APPNAME` | `RustDesk-headless` | isolates config / IPC from a classic RustDesk install (`~/.config/RustDesk-headless/`, `/tmp/RustDesk-headless/`). Set to `RustDesk` to share identity with the classic client. |
-| `RUSTDESK_SOCKET` | `$XDG_RUNTIME_DIR/rustdesk-headless.sock` | path to the daemon's JSON-RPC socket |
-
-### 4. Start the daemon
+### Start the daemon
 
 ```sh
 ./rustdesk/target/release/rustdesk-headless &
 ```
 
-The daemon binds a Unix socket at `$XDG_RUNTIME_DIR/rustdesk-headless.sock`
-(falls back to `/tmp/rustdesk-headless-<uid>.sock`), permissions `0600`.
-Run it as the same user that runs the MCP server.
+Windows:
+
+```powershell
+Start-Process -FilePath .\rustdesk\target\release\rustdesk-headless.exe
+```
+
+The daemon binds `127.0.0.1:<random port>` and writes a rendezvous
+file containing the port and auth token. The Python MCP server reads
+it to connect — no manual port / token plumbing needed.
+
+Rendezvous file location (auto-detected by both daemon and client):
+
+| OS | Path |
+|---|---|
+| Linux (systemd) | `$XDG_RUNTIME_DIR/rustdesk-headless/daemon.json` |
+| Linux (fallback) / macOS | `$TMPDIR/rustdesk-headless-<uid>/daemon.json` |
+| Windows | `%LOCALAPPDATA%\RustDesk-headless\daemon.json` |
+
+Run the daemon as the same user that runs the MCP server (file
+permissions are user-only).
 
 If you self-host RustDesk (recommended), make sure
-`~/.config/rustdesk/RustDesk2.toml` already has your
+`~/.config/RustDesk-headless/RustDesk-headless2.toml` has your
 `custom-rendezvous-server` and `key`, OR pass them per-call to
-`rustdesk_connect`.
+`rustdesk_connect`. Alternatively, copy your existing `~/.config/rustdesk/`
+to `~/.config/RustDesk-headless/` once at setup.
+
+### Environment variables
+
+Consumed by the Python server:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `RUSTDESK_HEADLESS_RENDEZVOUS` | platform default (see above) | override the rendezvous file path |
+| `GEMINI_API_KEY` | (unset) | required only if you call `rustdesk_watch_start` |
+| `RUSTDESK_VIEWER_PORT` | (unset) | auto-start the local HTTP viewer on that port |
+| `RUSTDESK_VIEWER_FPS` | 5 | refresh rate of the HTTP viewer |
+
+Consumed by the daemon:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `RUSTDESK_APPNAME` | `RustDesk-headless` | suffix that isolates config / IPC from a classic RustDesk install. Any other name is accepted; `RustDesk` is **refused** to avoid clobbering a classic client. |
+| `RUSTDESK_HEADLESS_RENDEZVOUS` | platform default | override the rendezvous file path |
 
 ## MCP tools
 
@@ -161,20 +226,30 @@ If you self-host RustDesk (recommended), make sure
 
 ## Security
 
-- Daemon binds a Unix socket with permissions `0600` (owner-only).
+- Daemon binds `127.0.0.1:<random>` only; the first frame on every
+  connection must be an `auth` call with the shared token from the
+  rendezvous file. Mismatched / missing tokens are rejected before any
+  RPC is processed. The token comparison is constant-time.
+- Rendezvous file is written user-only (`0600` on Unix; on Windows it
+  lives under `%LOCALAPPDATA%` which is user-ACL'd by default).
 - The HTTP viewer binds to `127.0.0.1` only — tunnel via SSH if you
   want remote access.
-- Passwords pass through the MCP socket, then the RustDesk protocol's
-  E2EE — they are never logged.
+- Passwords pass through the loopback connection, then the RustDesk
+  protocol's E2EE — they are never logged.
 - The daemon never executes shell commands on either end.
 - Screenshots go in MCP responses; if your LLM provider logs prompts,
   every frame the LLM sees is logged with them. Treat the remote peer
   accordingly.
+- The daemon refuses to start with `RUSTDESK_APPNAME=RustDesk` so it
+  can never collide with an installed classic RustDesk client's config
+  dir, named pipe, or IPC socket.
 
 ## Status
 
 MVP. Tested on Linux x86_64 hosts driving Linux and Windows peers
-through a self-hosted hbbs/hbbr. Patches against RustDesk 1.4.x.
+through a self-hosted hbbs/hbbr. macOS and Windows host builds are
+produced by CI (see `.github/workflows/build.yml`); tested via CI,
+community testing welcome. Patches against RustDesk 1.4.x.
 
 ## Caveats
 
@@ -188,8 +263,16 @@ through a self-hosted hbbs/hbbr. Patches against RustDesk 1.4.x.
 - The Gemini Live watcher's video sessions cap at ~2 minutes; the
   watcher reconnects transparently but you may see brief gaps in
   observations.
-- On the host, run the daemon as the same Linux user that runs the
-  MCP server (the Unix socket is owner-only).
+- **macOS:** first run will ask for *Accessibility* and *Screen
+  Recording* permissions (System Settings → Privacy & Security). These
+  are granted per-binary path, separate from any RustDesk.app grant.
+- **Windows:** SmartScreen may block the first run of an unsigned
+  binary — "More info" → "Run anyway". If your organization runs
+  AppLocker, whitelist the binary path.
+- The daemon stores its identity under a separate config dir
+  (`RustDesk-headless/`) so it never interferes with a classic RustDesk
+  install. The trade-off: you need to copy or re-enter your custom
+  rendezvous server and key once.
 
 ## License
 

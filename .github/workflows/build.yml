@@ -1,0 +1,136 @@
+name: Build rustdesk-headless
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: rustdesk-headless-linux-x64
+            bin: rustdesk-headless
+            script: ./headless/apply.sh
+          - os: macos-14
+            target: aarch64-apple-darwin
+            artifact: rustdesk-headless-macos-arm64
+            bin: rustdesk-headless
+            script: ./headless/apply.sh
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: rustdesk-headless-macos-x64
+            bin: rustdesk-headless
+            script: ./headless/apply.sh
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: rustdesk-headless-windows-x64
+            bin: rustdesk-headless.exe
+            script: powershell -ExecutionPolicy Bypass -File ./headless/apply.ps1
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.os }}-${{ hashFiles('headless/**', '.github/workflows/build.yml') }}
+          restore-keys: cargo-${{ matrix.os }}-
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            vcpkg
+            vcpkg-cache
+          key: vcpkg-${{ matrix.os }}-v1
+
+      - name: Cache rustdesk target/
+        uses: actions/cache@v4
+        with:
+          path: rustdesk/target
+          key: target-${{ matrix.os }}-${{ hashFiles('headless/**') }}
+          restore-keys: target-${{ matrix.os }}-
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm yasm clang cmake pkg-config \
+            libasound2-dev libpulse-dev libgtk-3-dev libxdo-dev libxfixes-dev \
+            libxcb-randr0-dev libxcb-shape0-dev libxcb-xfixes0-dev libpam0g-dev \
+            libva-dev libvdpau-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            curl zip unzip tar
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install nasm yasm cmake pkg-config llvm
+
+      - name: Install Windows deps
+        if: runner.os == 'Windows'
+        run: |
+          choco install -y nasm yasm
+          # cmake and git are already installed on windows-latest runners.
+
+      - name: Build rustdesk-headless
+        shell: bash
+        run: ${{ matrix.script }}
+
+      - name: Strip (Unix)
+        if: runner.os != 'Windows'
+        run: strip rustdesk/target/release/${{ matrix.bin }} || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: rustdesk/target/release/${{ matrix.bin }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Repack artifacts for release
+        run: |
+          mkdir -p release
+          cd dist
+          for dir in */; do
+            name="${dir%/}"
+            if [[ "$name" == *windows* ]]; then
+              (cd "$dir" && zip -9 "../../release/${name}.zip" *)
+            else
+              tar -C "$dir" -czf "../release/${name}.tar.gz" .
+            fi
+          done
+          ls -la ../release
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
