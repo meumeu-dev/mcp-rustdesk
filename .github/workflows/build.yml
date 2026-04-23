@@ -87,7 +87,7 @@ jobs:
           # Chocolatey's CDN occasionally returns 503 — retry up to 5 times.
           $ok = $false
           for ($i = 1; $i -le 5; $i++) {
-            Write-Host "Attempt $i: choco install nasm yasm"
+            Write-Host "Attempt ${i}: choco install nasm yasm"
             choco install -y --no-progress nasm yasm
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             Write-Host "choco failed (exit $LASTEXITCODE), retrying in 30s..."
